@@ -1,0 +1,9 @@
+# source it
+
+alias psql='~/inst/pg/bin/psql'
+alias pg_basebackup='~/inst/pg/bin/pg_basebackup'
+alias postgres='~/inst/pg/bin/postgres'
+alias pg_ctl='~/inst/pg/bin/pg_ctl'
+alias initdb='~/inst/pg/bin/initdb'
+alias pgbouncer='/usr/sbin/pgbouncer'
+

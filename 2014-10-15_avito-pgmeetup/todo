@@ -1,0 +1,61 @@
+* ================ 1 ============
+* initdb
+* postgresql.conf
+  - wal_level = hot_standby
+  - archive_command = on
+  - max_wal_senders = 5
+  - hot_standby = on
+  - log_min_messages = debug1
+* pg_hba.conf
+  - replication
+* pgbouncer master
+  - pool_mode = transaction
+  - demo = host=localhost pool_size=10
+* запуск pgbouncer
+* запуск master
+
+* pg_basebackup slave
+* recovery.conf
+  - restore_command
+  - standby_mode = on
+  - primary_conninfo
+* запуск slave (port 5433)
+
+* настроить мастер
+  - create table demo(txtime timestamptz default now(), v text);
+
+* клиент
+  - while sleep 5; do psql At -d demo -p 6543 -c "insert into demo (v) values (1) returning now()"
+
+* failover.sh
+
+* kill -9 master
+
+* ================ clean ============
+* остановить новый мастер
+* остановить клиента
+* rm master
+* mv slave master
+* rm wals/*
+
+* ================ 2 ============
+* master postgresql.conf
+  - log_line_prefix %m
+  - log_statement = all
+* запуск master
+* pg_basebackup backup
+* cp -a backup slave
+* mv recovery.done recovery.conf
+* запуск slave
+* запуск клиента на master
+* ждём штуки 3 транзакции
+* drop table demo
+* стоп master, slave
+* cp -a backup master2
+* recovery.conf (дата drop table, recovery_target_inclusive = false)
+* запуск master
+* показать что восстановились куда надо, pg_xlog_replay_resume()
+* показать что клиент продолжил выполнение
+* остановить клиента
+* показать что последний insert восстановился и есть новые записи клиента
+

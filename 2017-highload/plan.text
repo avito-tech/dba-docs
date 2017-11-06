@@ -1,0 +1,714 @@
+План:
+* инициализация базы 9.6
+  - 3 кластера: master, standby, repca1
+  - 2 таблицы на master и repca1: items, cats
+  - добавить по две строки
+* создание репликации londiste (с undo)
+* показать что данные реплицируются
+* создать вторую реплику через pg_dump
+* эмуляция задержки бинарной репликации
+* падение мастера и promote standby
+* показать что реплика в будущем
+  - репликация не работает
+* выполнить undo
+* показать что репликация работает
+
+* инициализация базы 10
+  - 3 кластера: master, standby, repca1
+  - 2 таблицы на master и repca1: items, cats
+  - добавить по две строки
+* создание логической репликации
+* показать что данные реплицируются
+* инициализировать undo
+* создать вторую реплику через pg_dump (с паузой репликации)
+* эмуляция задержки бинарной репликации
+* падение мастера и promote standby
+* показать что реплика в будущем
+  - репликация не работает
+* выполнить undo
+* показать что репликация работает
+
+======== === ========
+cat > .screenrc <<'EOF'
+defscrollback 5000
+caption always "[%H %l %c]  (%w)"
+EOF
+
+sudoedit /etc/vim/vimrc
+sudo update-alternatives --config editor
+
+unset LC_ALL; export LC_MESSAGES=C;
+
+cat > pgq.patch <<'EOF'
+diff --git a/python/pgq/consumer.py b/python/pgq/consumer.py
+index 4ff3e93..c352d26 100644
+--- a/python/pgq/consumer.py
++++ b/python/pgq/consumer.py
+@@ -388,8 +388,10 @@ class SerialConsumer(Consumer):
+                 help = "change queue position according to destination")
+         p.add_option("--reset", action = "store_true",
+                 help = "reset queue pos on destination side")
+-        p.add_option("--enable-undolog", action="store_true", dest="enable_undolog",
+-                help = "generate UNDO log", default=False)
++        p.add_option("--enable-undolog", action = "store_true", dest = "enable_undolog",
++                help = "generate UNDO log", default = False)
++        p.add_option("--force", action = "store_true",
++                help = "force", default = False)
+         return p
+ 
+     def process_batch(self, db, batch_id, event_list):
+EOF
+sudo patch /usr/lib/python2.7/dist-packages/pgq/consumer.py pgq.patch
+
+======== 9.6 ========
+sudo pg_dropcluster --stop 9.6 main
+sudo pg_dropcluster --stop 9.4 main
+sudo pg_dropcluster --stop 10 main
+
+sudo pg_createcluster --start 9.6 main -- --auth-local=trust
+sudo pg_createcluster 9.6 standby -- --auth-local=trust
+sudo pg_createcluster --start 9.6 repca1 -- --auth-local=trust
+sudo pg_createcluster --start 9.6 repca2 -- --auth-local=trust
+
+--- откроем доступ для replication
+sudoedit /etc/postgresql/9.6/main/pg_hba.conf
+
+psql --cluster 9.6/main -U postgres -X -f- <<'EOF'
+alter system set wal_level = logical;
+alter system set log_min_messages to notice;
+alter system set max_wal_senders to 10;
+alter system set max_replication_slots to 10;
+alter system set hot_standby to on;
+EOF
+
+cat > init.sql <<'EOF'
+alter system set log_min_messages to notice;
+select pg_reload_conf();
+EOF
+
+psql --cluster 9.6/repca1 -U postgres -X -f init.sql
+psql --cluster 9.6/repca2 -U postgres -X -f init.sql
+
+sudo pg_ctlcluster 9.6 main restart
+sudo tail /var/log/postgresql/postgresql-9.6-main.log
+
+ps U postgres f
+
+sudo -u postgres -i bash -c 'rm -r 9.6/standby/*'
+sudo -u postgres -i pg_receivexlog --cluster 9.6/main --create-slot -S standby
+sudo -u postgres -i pg_basebackup --cluster 9.6/main -D 9.6/standby -X stream -R -S standby -c fast
+sudo pg_ctlcluster 9.6 standby start
+sudo tail /var/log/postgresql/postgresql-9.6-standby.log
+
+----------------
+
+createdb --cluster 9.6/main -U postgres src
+createdb --cluster 9.6/repca1 -U postgres dst
+
+cat > init.sql <<'EOF'
+create table cats (cat_id serial primary key, cat_name text unique);
+create table items (item_id serial primary key, created_at timestamptz default now(), cat_id int references cats, v text);
+EOF
+
+psql --cluster 9.6/main -U postgres -1 -X -d src -f init.sql
+
+psql --cluster 9.6/repca1 -U postgres -1 -X -d dst -f init.sql
+psql --cluster 9.6/repca1 -U postgres -1 -X -d dst -f- <<'EOF'
+alter table items set unlogged;
+alter table cats set unlogged;
+EOF
+
+psql --cluster 9.6/main -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('категория 1');
+insert into cats (cat_name) values ('категория 2');
+insert into items (cat_id, v) values (1, 'aaa');
+insert into items (cat_id, v) values (2, 'bbb');
+EOF
+
+-------- создание репликации londiste (с undo) --------
+
+cat > pgqadm.conf <<'EOF'
+[pgqadm]
+job_name = pgqadm
+
+db = port=5432 dbname=src user=postgres
+
+# how often to run maintenance [seconds]
+maint_delay = 600
+
+# how often to check for activity [seconds]
+loop_delay = 1.0
+
+logfile = /home/pghack/%(job_name)s.log
+pidfile = /home/pghack/%(job_name)s.pid
+EOF
+
+cat > londiste01.conf <<'EOF'
+[londiste]
+job_name = londiste_1
+
+provider_db = dbname=src port=5432 user=postgres
+provider_standby_db = dbname=src port=5433 user=postgres
+subscriber_db = dbname=dst port=5434 user=postgres
+
+# it will be used as sql ident so no dots/spaces
+pgq_queue_name = londiste.repca
+
+logfile = /home/pghack/%(job_name)s.log
+pidfile = /home/pghack/%(job_name)s.pid
+EOF
+
+pgqadm pgqadm.conf install
+londiste londiste01.conf provider install
+londiste londiste01.conf subscriber install
+
+--- для демонстрации ускорим
+pgqadm pgqadm.conf config londiste.repca queue_ticker_idle_period=5
+
+pgqadm pgqadm.conf ticker -d
+tail pgqadm.log
+
+londiste londiste01.conf replay --enable-undolog -d
+tail londiste_1.log
+
+londiste londiste01.conf provider add cats items
+londiste londiste01.conf subscriber add cats items
+
+londiste londiste01.conf subscriber tables
+
+psql --cluster 9.6/main -U postgres -1 -X -d src -f- <<'EOF'
+insert into items (cat_id, v) values (2, 'ccc');
+EOF
+
+londiste londiste01.conf subscriber add-undo-all
+
+-------- показать что данные реплицируются --------
+
+psql --cluster 9.6/repca1 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
+
+psql --cluster 9.6/main -U postgres -1 -X -d src -f- <<'EOF'
+insert into items (cat_id, v) values (2, 'ccc ccc');
+EOF
+
+psql --cluster 9.6/repca1 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
+
+-------- создать вторую реплику через pg_dump --------
+
+1. pgqadm pgqadm.conf status
+   pgqadm pgqadm.conf register londiste.repca londiste_2
+   pgqadm pgqadm.conf status
+   --- Lag больше
+
+2. pg_dump --cluster 9.6/repca1 -U postgres -Fc --serializable-deferrable -d dst \
+     | pg_restore --cluster 9.6/repca2 -U postgres -C -d postgres
+
+3. psql --cluster 9.6/main -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('категория 3');
+insert into items (cat_id, v) values (3, 'ddd');
+EOF
+
+4. psql --cluster 9.6/repca2 -U postgres -1 -X -d dst -c 'select * from londiste.completed'
+   psql --cluster 9.6/repca2 -U postgres -1 -X -d dst -c "update londiste.completed set consumer_id = 'londiste_2'"
+
+   cat > londiste02.conf <<'EOF'
+[londiste]
+job_name = londiste_2
+
+provider_db = dbname=src port=5432 user=postgres
+provider_standby_db = dbname=src port=5433 user=postgres
+subscriber_db = dbname=dst port=5435 user=postgres
+
+# it will be used as sql ident so no dots/spaces
+pgq_queue_name = londiste.repca
+
+logfile = /home/pghack/%(job_name)s.log
+pidfile = /home/pghack/%(job_name)s.pid
+EOF
+
+5. londiste londiste02.conf provider curr-tick
+   londiste londiste02.conf subscriber curr-tick
+
+   londiste londiste02.conf replay --rewind
+
+   londiste londiste02.conf provider curr-tick
+   londiste londiste02.conf subscriber curr-tick
+
+9. psql --cluster 9.6/repca2 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
+
+   londiste londiste02.conf replay --enable-undolog -d
+   tail londiste_1.log
+
+   psql --cluster 9.6/repca2 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
+
+-------- эмуляция задержки бинарной репликации --------
+
+pg_lsclusters
+
+--- закроем доступ для replication
+sudoedit /etc/postgresql/9.6/main/pg_hba.conf
+
+sudo pg_ctlcluster 9.6/main reload
+
+psql --cluster 9.6/main -U postgres -X -d src -c "select pg_terminate_backend(active_pid) from pg_replication_slots where slot_name = 'standby'"
+
+psql --cluster 9.6/main -U postgres -X -d src -c 'select * from cats natural join items order by item_id'
+psql --cluster 9.6/standby -U postgres -X -d src -c 'select * from cats natural join items order by item_id'
+
+psql --cluster 9.6/main -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('категория 10');
+insert into cats (cat_name) values ('категория 20');
+insert into cats (cat_name) values ('категория 30');
+EOF
+
+psql --cluster 9.6/main -U postgres -X -d src -c 'select * from cats'
+psql --cluster 9.6/repca1 -U postgres -X -d dst -c 'select * from cats'
+psql --cluster 9.6/standby -U postgres -X -d src -c 'select * from cats'
+
+-------- падение мастера и promote standby --------
+
+sudo pg_ctlcluster -m immediate 9.6 main stop -- -m immediate
+
+sudo pg_ctlcluster 9.6 standby promote
+
+sed -i -e 's/5432/5433/' pgqadm.conf
+
+pgqadm pgqadm.conf ticker -s
+pgqadm pgqadm.conf ticker -d
+tail pgqadm.log
+
+sed -i -e 's/5432/5433/' londiste01.conf
+
+londiste londiste01.conf replay -s
+londiste londiste01.conf replay --enable-undolog -d
+
+-------- показать что реплика в будущем --------
+
+psql --cluster 9.6/standby -U postgres -X -d src -c 'select * from cats'
+psql --cluster 9.6/repca1 -U postgres -X -d dst -c 'select * from cats'
+
+- репликация не работает
+
+tail londiste_1.log
+
+psql --cluster 9.6/standby -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('категория 10');
+insert into cats (cat_name) values ('категория 20');
+insert into cats (cat_name) values ('категория 30');
+EOF
+
+psql --cluster 9.6/standby -U postgres -X -d src -c 'select * from cats'
+psql --cluster 9.6/repca1 -U postgres -X -d dst -c 'select * from cats'
+
+-------- выполнить undo --------
+
+psql --cluster 9.6/repca1 -U postgres -X -d dst -c 'select id, txtime, tick_id, undo_cmd, cmd_data, cmd_pk from londiste_undo.undo_log order by id'
+
+londiste londiste01.conf provider curr-tick
+londiste londiste01.conf subscriber curr-tick
+
+londiste londiste01.conf replay -s
+
+londiste londiste01.conf subscriber undo
+
+psql --cluster 9.6/repca1 -U postgres -X -d dst -c 'select id, txtime, tick_id, undo_cmd, cmd_data, cmd_pk from londiste_undo.undo_log order by id'
+
+psql --cluster 9.6/standby -U postgres -X -d src -c 'select * from cats'
+psql --cluster 9.6/repca1 -U postgres -X -d dst -c 'select * from cats'
+
+londiste londiste01.conf provider curr-tick
+londiste londiste01.conf subscriber curr-tick
+
+-------- показать что репликация работает --------
+
+londiste londiste01.conf replay --enable-undolog -d
+tail londiste_1.log
+
+psql --cluster 9.6/standby -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('категория 100');
+insert into cats (cat_name) values ('категория 200');
+insert into cats (cat_name) values ('категория 300');
+EOF
+
+psql --cluster 9.6/standby -U postgres -X -d src -c 'select * from cats'
+psql --cluster 9.6/repca1 -U postgres -X -d dst -c 'select * from cats'
+
+======== 10 ========
+sudo pg_dropcluster --stop 9.6 main
+sudo pg_dropcluster --stop 9.6 repca1
+sudo pg_dropcluster --stop 9.6 repca2
+sudo pg_dropcluster --stop 9.6 standby
+
+sudo pg_createcluster --start 10 main -- --auth-local=trust
+sudo pg_createcluster 10 standby -- --auth-local=trust
+sudo pg_createcluster --start 10 repca1 -- --auth-local=trust
+sudo pg_createcluster --start 10 repca2 -- --auth-local=trust
+
+psql --cluster 10/main -U postgres -X -f- <<'EOF'
+alter system set wal_level = logical;
+alter system set log_min_messages to notice;
+EOF
+
+cat > init.sql <<'EOF'
+alter system set log_min_messages to notice;
+select pg_reload_conf();
+EOF
+
+psql --cluster 10/repca1 -U postgres -X -f init.sql
+psql --cluster 10/repca2 -U postgres -X -f init.sql
+
+sudo pg_ctlcluster 10 main restart
+sudo tail /var/log/postgresql/postgresql-10-main.log
+
+ps U postgres f
+
+sudo -u postgres -i bash -c 'rm -r 10/standby/*'
+sudo -u postgres -i pg_receivewal --cluster 10/main --create-slot -S standby
+sudo -u postgres -i pg_basebackup --cluster 10/main -D 10/standby -R -S standby -c fast
+sudo pg_ctlcluster 10 standby start
+sudo tail /var/log/postgresql/postgresql-10-standby.log
+
+----------------
+
+createdb --cluster 10/main -U postgres src
+createdb --cluster 10/repca1 -U postgres dst
+
+cat > init.sql <<'EOF'
+create table cats (cat_id serial primary key, cat_name text unique);
+create table items (item_id serial primary key, created_at timestamptz default now(), cat_id int references cats, v text);
+EOF
+
+psql --cluster 10/main -U postgres -1 -X -d src -f init.sql
+
+psql --cluster 10/repca1 -U postgres -1 -X -d dst -f init.sql
+psql --cluster 10/repca1 -U postgres -1 -X -d dst -f- <<'EOF'
+alter table items set unlogged;
+alter table cats set unlogged;
+EOF
+
+psql --cluster 10/main -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('категория 1');
+insert into cats (cat_name) values ('категория 2');
+insert into items (cat_id, v) values (1, 'aaa');
+insert into items (cat_id, v) values (2, 'bbb');
+EOF
+
+-------- создание логической репликации --------
+
+psql --cluster 10/main -U postgres -X -d src -f- <<'EOF'
+create publication pub for table items, cats;
+EOF
+
+psql --cluster 10/repca1 -U postgres -X -d dst -f- <<'EOF'
+create subscription repca1 connection 'port=5432 dbname=src' publication pub;
+EOF
+
+-------- показать что данные реплицируются --------
+
+psql --cluster 10/repca1 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
+
+psql --cluster 10/main -U postgres -1 -X -d src -f- <<'EOF'
+insert into items (cat_id, v) values (2, 'ccc');
+EOF
+
+psql --cluster 10/repca1 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
+
+-------- инициализировать undo --------
+
+cat > init.sql <<'EOF'
+create extension hstore;
+create table undo_log (
+    id bigserial primary key,
+    txtime timestamptz default now(),
+    lsn pg_lsn default pg_replication_origin_session_progress(false),
+    dst_schema name, dst_table name,
+    undo_cmd char, cmd_data hstore, cmd_pk hstore
+);
+create function undo_trg() returns trigger language plpgsql
+as $$
+declare
+  cmd     char;
+  res     record;
+  data    hstore;
+  pk_data hstore;
+  pk_name text;
+  tmp     hstore;
+begin
+  pk_name := TG_ARGV[0];
+
+  raise notice 'prev recv LSN: %', pg_replication_origin_session_progress(false);
+
+  if TG_OP = 'INSERT' then
+      --- откат для INSERT -> DELETE, нужен PK из NEW
+      res := NEW;
+      cmd := 'D'; pk_data := hstore(pk_name, hstore(NEW)->pk_name);
+  elsif TG_OP = 'UPDATE' then
+      --- откат для UPDATE -> UPDATE, нужно старое значение строки и новый PK
+      --- для оптимизации, будем хранить только изменённые колонки и новый PK
+      res := NEW;
+      tmp := hstore(NEW);
+      cmd := 'U'; pk_data := hstore(pk_name, tmp->pk_name); data := (hstore(OLD) - tmp);
+  elsif TG_OP = 'DELETE' then
+      --- откат для DELETE -> INSERT, нужно старое значение строки
+      res := OLD;
+      cmd := 'I';
+      select hstore(array_agg(h.key), array_agg(h.value))
+             into data
+      from each(hstore(OLD)) h
+      where h.value is not null;
+  end if;
+
+  insert into undo_log (dst_schema, dst_table, undo_cmd, cmd_data, cmd_pk)
+  values (TG_TABLE_SCHEMA, TG_TABLE_NAME, cmd, data, pk_data);
+
+  return res;
+end
+$$;
+
+create trigger xx99_undo after insert or delete or update on cats for each row execute procedure undo_trg('cat_id');
+alter table cats enable replica trigger xx99_undo;
+
+create trigger xx99_undo after insert or delete or update on items for each row execute procedure undo_trg('item_id');
+alter table items enable replica trigger xx99_undo;
+
+--------
+
+create function gen_where_pk(i_alias text, i_keys hstore) returns text language sql
+as $$
+  select string_agg(format('%I.%I = %L', i_alias, x.key, x.value), ' AND ') from each(i_keys) x;
+$$;
+
+create function gen_upd_set(i_keys hstore) returns text language sql
+as $$
+  select string_agg(format('%I = %L', x.key, x.value), ', ') from each(i_keys) x;
+$$;
+
+create function run_undo(i_del_lsn pg_lsn) returns integer language plpgsql
+as $$
+--- откатываем в порядке обратном их записи в log (order by lsn desc nulls last)
+--- i_del_lsn — определяет "отрезок" в log, с начала lsn которого всё будет удалено,
+--- так как записи в undo маркируются _предыдущим_ LSN :-(
+--- то есть откатываются все данные из undo_log, lsn которых больше i_del_lsn,
+--- плюс один предыдущий
+declare
+  node_name text default (select roname from pg_replication_origin);
+  u undo_log;
+  locked text[] default '{}';
+  tbl_alias constant text := 'd';
+  tbl_name text;
+  query text;
+  applied_cnt int default 0;
+  rec record;
+  last_canceled_lsn pg_lsn;
+  prev_del_lsn pg_lsn;
+begin
+  --- sanity check
+  if coalesce(i_del_lsn, '0/0') = '0/0' then
+    raise exception 'run_undo: i_del_lsn must be set';
+  end if;
+
+  raise notice 'last applied LSN: %', pg_replication_origin_progress(node_name, false);
+
+  if i_del_lsn >= pg_replication_origin_progress(node_name, false) then
+    raise notice 'run_undo: nothing to undo, i_del_lsn must be less than current subscriber lsn';
+    return 0;
+  end if;
+
+  --- заблокируем все откатываемые таблицы и отключим undo триггеры
+  for u in
+    select * from undo_log x
+    where x.lsn > i_del_lsn
+  loop
+    tbl_name := format('%I.%I', u.dst_schema, u.dst_table);
+    if tbl_name <> all (locked) then
+      raise notice 'locking % ...', tbl_name;
+      execute 'lock ' || tbl_name;
+      locked := locked || array[tbl_name];
+
+      execute format('alter table %s disable trigger all', tbl_name);
+      raise notice 'disable triggers %', tbl_name;
+    end if;
+  end loop;
+
+  select l.lsn into prev_del_lsn from undo_log l where l.lsn <= i_del_lsn order by l.lsn desc limit 1;
+  if not found or prev_del_lsn is null then
+    raise exception 'run_undo: undo incomplete, abort';
+  end if;
+
+  raise notice 'undo events with LSN >= %', prev_del_lsn;
+
+  for u in with
+    src as (
+      delete from undo_log x
+      where x.lsn >= prev_del_lsn returning *
+    )
+    select * from src order by src.id desc
+  loop
+    last_canceled_lsn := u.lsn;
+
+    applied_cnt := applied_cnt + 1;
+    tbl_name := format('%I.%I', u.dst_schema, u.dst_table);
+
+    query := case u.undo_cmd
+      when 'D' then 'DELETE FROM ONLY '
+      when 'I' then 'INSERT INTO '
+      when 'U' then 'UPDATE ONLY '
+    end;
+
+    query := query || format('%s %s ', tbl_name, case when u.undo_cmd = 'I' then '' else quote_ident(tbl_alias) end);
+
+    query := query || case u.undo_cmd
+      when 'D' then ' WHERE ' || gen_where_pk(tbl_alias, u.cmd_pk)
+      when 'I' then format(' SELECT (populate_record(NULL::%s, $1)).* ', tbl_name)
+      when 'U' then ' SET ' || gen_upd_set(u.cmd_data) || ' WHERE ' || gen_where_pk(tbl_alias, u.cmd_pk)
+    end;
+
+    raise notice 'undo (% | %): %', u.id, last_canceled_lsn, query;
+
+    if u.undo_cmd = 'I' then
+      execute query using u.cmd_data;
+    else
+      execute query;
+    end if;
+  end loop;
+
+  --- установить последний проигранный lsn в последний отменённый lsn,
+  --- который удалиться из UNDO последним
+  raise notice 'set current replayed LSN to %', last_canceled_lsn;
+  perform pg_replication_origin_advance(node_name, last_canceled_lsn);
+
+  --- вернём обратно отключенные триггеры
+  for rec in select unnest(locked) as tbl_name
+  loop
+    execute format('alter table %s enable trigger all', rec.tbl_name);
+    raise notice 'enable triggers %', rec.tbl_name;
+  end loop;
+
+  return applied_cnt;
+end
+$$;
+
+EOF
+
+psql --cluster 10/repca1 -U postgres -1 -X -d dst -f init.sql
+
+-------- создать вторую реплику через pg_dump (с паузой репликации) --------
+
+1. слот для новой реплики:
+   pg_recvlogical --cluster 10/main -U postgres -d src --create-slot -S repca2 -P pgoutput
+   psql --cluster 10/main -U postgres -X -d src -c 'select * from pg_replication_slots'
+
+2. psql --cluster 10/repca1 -U postgres -X -d dst -c 'alter subscription repca1 disable'
+
+3. psql --cluster 10/main -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('категория 3');
+insert into items (cat_id, v) values (3, 'ddd');
+EOF
+
+4. текущий LSN:
+   psql --cluster 10/repca1 -U postgres -X -d dst -c 'select * from pg_replication_origin_status'
+
+5. pg_dump --cluster 10/repca1 -U postgres -Fc --serializable-deferrable --no-subscriptions -d dst \
+   | pg_restore --cluster 10/repca2 -U postgres -C -d postgres
+
+6. параллельно:
+   psql --cluster 10/repca1 -U postgres -X -d dst -c 'alter subscription repca1 enable'
+   psql --cluster 10/repca1 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
+
+   psql --cluster 10/repca2 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
+   psql --cluster 10/main -U postgres -X -d src -c 'select * from pg_replication_slots'
+
+7. psql --cluster 10/repca2 -U postgres -X -d dst -f- <<'EOF'
+create subscription repca2 connection 'port=5432 dbname=src' publication pub with (enabled = false, create_slot = false, copy_data = false);
+select oid, * from pg_subscription;
+EOF
+
+8. psql --cluster 10/repca2 -U postgres -X -d dst -c 'select * from pg_replication_origin_status'
+   psql --cluster 10/repca2 -U postgres -X -d dst -c "select pg_replication_origin_advance(:node_name:, :last_canceled_lsn:)"
+   psql --cluster 10/repca2 -U postgres -X -d dst -c 'select * from pg_replication_origin_status'
+
+9. psql --cluster 10/repca2 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
+   psql --cluster 10/repca2 -U postgres -X -d dst -c 'alter subscription repca2 enable'
+   psql --cluster 10/repca2 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
+
+   psql --cluster 10/main -U postgres -X -d src -c 'select * from pg_replication_slots'
+   psql --cluster 10/repca2 -U postgres -X -d dst -c 'select * from pg_replication_origin_status'
+   psql --cluster 10/repca1 -U postgres -X -d dst -c 'select * from pg_replication_origin_status'
+
+-------- эмуляция задержки бинарной репликации --------
+
+pg_lsclusters
+
+--- закроем доступ для replication
+sudoedit /etc/postgresql/10/main/pg_hba.conf
+
+sudo pg_ctlcluster 10/main reload
+
+psql --cluster 10/main -U postgres -X -d src -c "select pg_terminate_backend(active_pid) from pg_replication_slots where slot_name = 'standby'"
+
+psql --cluster 10/main -U postgres -X -d src -c 'select * from cats natural join items order by item_id'
+psql --cluster 10/standby -U postgres -X -d src -c 'select * from cats natural join items order by item_id'
+
+psql --cluster 10/main -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('категория 10');
+insert into cats (cat_name) values ('категория 20');
+insert into cats (cat_name) values ('категория 30');
+EOF
+
+psql --cluster 10/main -U postgres -X -d src -c 'select * from cats'
+psql --cluster 10/repca1 -U postgres -X -d dst -c 'select * from cats'
+psql --cluster 10/standby -U postgres -X -d src -c 'select * from cats'
+
+-------- падение мастера и promote standby --------
+
+sudo pg_ctlcluster -m immediate 10 main stop -- -m immediate
+
+psql --cluster 10/standby -U postgres -X -d src -c 'select pg_last_wal_replay_lsn()'
+
+sudo pg_ctlcluster 10 standby promote
+
+pg_recvlogical --cluster 10/standby -U postgres -d src --create-slot -S repca1 -P pgoutput
+
+-------- показать что реплика в будущем --------
+
+psql --cluster 10/standby -U postgres -X -d src -c 'select * from cats'
+psql --cluster 10/repca1 -U postgres -X -d dst -c 'select * from cats'
+
+psql --cluster 10/repca1 -U postgres -X -d dst -c 'select * from undo_log order by id'
+psql --cluster 10/repca1 -U postgres -X -d dst -c 'select * from pg_replication_origin_status'
+
+- репликация не работает
+
+psql --cluster 10/repca1 -U postgres -X -d dst -f- <<'EOF'
+alter subscription repca1 CONNECTION 'port=5433 dbname=src';
+EOF
+
+psql --cluster 10/standby -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('категория 10');
+insert into cats (cat_name) values ('категория 20');
+insert into cats (cat_name) values ('категория 30');
+EOF
+
+psql --cluster 10/repca1 -U postgres -X -d dst -c 'select * from cats'
+psql --cluster 10/standby -U postgres -X -d src -c 'select * from cats'
+
+-------- выполнить undo --------
+
+psql --cluster 10/repca1 -U postgres -X -d dst -c 'alter subscription repca1 disable'
+
+psql --cluster 10/repca1 -U postgres -X -d dst -c 'select * from undo_log order by id'
+psql --cluster 10/repca1 -U postgres -X -d dst -c 'select * from pg_replication_origin_status'
+
+psql --cluster 10/repca1 -U postgres -X -d dst -c "select run_undo(:lsn:)"
+
+-------- показать что репликация работает --------
+
+psql --cluster 10/repca1 -U postgres -X -d dst -c 'alter subscription repca1 enable'
+
+psql --cluster 10/standby -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('категория 100');
+insert into cats (cat_name) values ('категория 200');
+insert into cats (cat_name) values ('категория 300');
+EOF
+
+psql --cluster 10/standby -U postgres -X -d src -c 'select * from cats'
+psql --cluster 10/repca1 -U postgres -X -d dst -c 'select * from cats'

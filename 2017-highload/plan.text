@@ -229,7 +229,7 @@ EOF
    londiste londiste02.conf provider curr-tick
    londiste londiste02.conf subscriber curr-tick
 
-9. psql --cluster 9.6/repca2 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
+6. psql --cluster 9.6/repca2 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
 
    londiste londiste02.conf replay --enable-undolog -d
    tail londiste_2.log

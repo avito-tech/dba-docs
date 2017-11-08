@@ -176,10 +176,6 @@ londiste londiste01.conf subscriber add cats items
 
 londiste londiste01.conf subscriber tables
 
-psql --cluster 9.6/main -U postgres -1 -X -d src -f- <<'EOF'
-insert into items (cat_id, v) values (2, 'ccc');
-EOF
-
 londiste londiste01.conf subscriber add-undo-all
 
 -------- показать что данные реплицируются --------
@@ -187,7 +183,7 @@ londiste londiste01.conf subscriber add-undo-all
 psql --cluster 9.6/repca1 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
 
 psql --cluster 9.6/main -U postgres -1 -X -d src -f- <<'EOF'
-insert into items (cat_id, v) values (2, 'ccc ccc');
+insert into items (cat_id, v) values (2, 'ccc');
 EOF
 
 psql --cluster 9.6/repca1 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
@@ -236,7 +232,7 @@ EOF
 9. psql --cluster 9.6/repca2 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
 
    londiste londiste02.conf replay --enable-undolog -d
-   tail londiste_1.log
+   tail londiste_2.log
 
    psql --cluster 9.6/repca2 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
 

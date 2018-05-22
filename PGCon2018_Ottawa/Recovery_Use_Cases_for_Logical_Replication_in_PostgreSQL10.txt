@@ -1,0 +1,583 @@
+sudo -u postgres -i  
+
+/usr/lib/postgresql/10/bin/pg_ctl  -D /var/lib/postgresql/10/main  initdb
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/main -l  /var/log/postgresql/postgresql-10-main.log start 
+
+ /usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/standby  initdb
+ /usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/repca1  initdb
+ /usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/repca2  initdb
+ 
+psql -p 5432 -U postgres -X -f- <<'EOF'
+alter system set wal_level = logical;
+alter system set log_min_messages to notice;
+EOF
+
+cat > init.sql <<'EOF'
+alter system set log_min_messages to notice;
+select pg_reload_conf();
+EOF
+
+
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/repca1 -l  /var/log/postgresql/postgresql-10-repca1.log -o "-p 5434" start
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/repca2 -l  /var/log/postgresql/postgresql-10-repca2.log -o "-p 5435" start
+
+
+psql -p 5434 -U postgres -X -f init.sql
+psql -p 5435 -U postgres -X -f init.sql
+
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/main -o  "-p 5432" -l  /var/log/postgresql/postgresql-10-main.log restart 
+
+rm -r 10/standby/*
+
+pg_receivewal -p 5432 --create-slot -S standby
+
+pg_basebackup -p 5432 -D 10/standby -R -S standby -c fast
+
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/standby -l  /var/log/postgresql/postgresql-10-standby.log -o "-p 5433" start
+
+-------------------------------------------------
+
+createdb -p 5432 -U postgres src
+createdb -p 5434 -U postgres dst
+
+
+cat > init.sql <<'EOF'
+create table cats (cat_id serial primary key, cat_name text unique);
+create table items (item_id serial primary key, created_at timestamptz default now(), cat_id int references cats, v text);
+EOF
+
+
+psql -p 5432 -U postgres -1 -X -d src -f init.sql
+
+
+psql -p 5434 -U postgres -1 -X -d dst -f init.sql
+psql -p 5434 -U postgres -1 -X -d dst -f- <<'EOF'
+alter table items set unlogged;
+alter table cats set unlogged;
+EOF
+
+
+
+psql -p 5432 -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('category 1');
+insert into cats (cat_name) values ('category 2');
+insert into items (cat_id, v) values (1, 'value aaa');
+insert into items (cat_id, v) values (2, 'value bbb');
+EOF
+
+
+
+-------- setup logical replication --------
+
+psql -p 5432 -U postgres -X -d src -f- <<'EOF'
+create publication pub for table items, cats;
+EOF
+
+psql -p 5434 -U postgres -X -d dst -f- <<'EOF'
+create subscription repca1 connection 'port=5432 dbname=src' publication pub;
+EOF
+
+
+-------- showing that data is replicated --------
+
+psql -p 5434 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
+
+psql -p 5432 -U postgres -1 -X -d src -f- <<'EOF'
+insert into items (cat_id, v) values (2, 'value ccc');
+EOF
+
+psql -p 5434 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
+
+
+-------- initializing Undo --------
+
+
+cat > init.sql <<'EOF'
+create extension hstore;
+create table undo_log (
+    id bigserial primary key,
+    txtime timestamptz default now(),
+    lsn pg_lsn default pg_replication_origin_session_progress(false),
+    dst_schema name, dst_table name,
+    undo_cmd char, cmd_data hstore, cmd_pk hstore
+);
+create function undo_trg() returns trigger language plpgsql
+as $$
+declare
+  cmd     char;
+  res     record;
+  data    hstore;
+  pk_data hstore;
+  pk_name text;
+  tmp     hstore;
+begin
+  pk_name := TG_ARGV[0];
+
+  raise notice 'prev recv LSN: %', pg_replication_origin_session_progress(false);
+
+  if TG_OP = 'INSERT' then
+      --- Undo for INSERT -> DELETE, pk from NEW is needed
+      res := NEW;
+      cmd := 'D'; pk_data := hstore(pk_name, hstore(NEW)->pk_name);
+  elsif TG_OP = 'UPDATE' then
+      --- Undo for UPDATE -> UPDATE, old value and new PK are needed
+      --- for optimizaition goals storing only changed columns and new PK
+      res := NEW;
+      tmp := hstore(NEW);
+      cmd := 'U'; pk_data := hstore(pk_name, tmp->pk_name); data := (hstore(OLD) - tmp);
+  elsif TG_OP = 'DELETE' then
+      --- undo for DELETE -> INSERT, OLD row value is neded
+      res := OLD;
+      cmd := 'I';
+      select hstore(array_agg(h.key), array_agg(h.value))
+             into data
+      from each(hstore(OLD)) h
+      where h.value is not null;
+  end if;
+
+  insert into undo_log (dst_schema, dst_table, undo_cmd, cmd_data, cmd_pk)
+  values (TG_TABLE_SCHEMA, TG_TABLE_NAME, cmd, data, pk_data);
+
+  return res;
+end
+$$;
+
+
+create trigger xx99_undo after insert or delete or update on cats for each row execute procedure undo_trg('cat_id');
+alter table cats enable replica trigger xx99_undo;
+
+create trigger xx99_undo after insert or delete or update on items for each row execute procedure undo_trg('item_id');
+alter table items enable replica trigger xx99_undo;
+
+--------
+
+create function gen_where_pk(i_alias text, i_keys hstore) returns text language sql
+as $$
+  select string_agg(format('%I.%I = %L', i_alias, x.key, x.value), ' AND ') from each(i_keys) x;
+$$;
+
+create function gen_upd_set(i_keys hstore) returns text language sql
+as $$
+  select string_agg(format('%I = %L', x.key, x.value), ', ') from each(i_keys) x;
+$$;
+
+create function run_undo(i_del_lsn pg_lsn) returns integer language plpgsql
+as $$
+---  apply UNDO (order by lsn desc nulls last)
+--- i_del_lsn — start of UNDO interval 
+--- rows in undo table are marked with previous LSN :-(
+--- i.e. all rows from undo log table with  lsn = i_del_lsn + 1 previous are applied
+declare
+  node_name text default (select roname from pg_replication_origin);
+  u undo_log;
+  locked text[] default '{}';
+  tbl_alias constant text := 'd';
+  tbl_name text;
+  query text;
+  applied_cnt int default 0;
+  rec record;
+  last_canceled_lsn pg_lsn;
+  prev_del_lsn pg_lsn;
+begin
+  --- sanity check
+  if coalesce(i_del_lsn, '0/0') = '0/0' then
+    raise exception 'run_undo: i_del_lsn must be set';
+  end if;
+
+  raise notice 'last applied LSN: %', pg_replication_origin_progress(node_name, false);
+
+  if i_del_lsn >= pg_replication_origin_progress(node_name, false) then
+    raise notice 'run_undo: nothing to undo, i_del_lsn must be less than current subscriber lsn';
+    return 0;
+  end if;
+
+  --- lock all tables for undo and turn off undo triggers
+  for u in
+    select * from undo_log x
+    where x.lsn >= prev_del_lsn
+  loop
+    tbl_name := format('%I.%I', u.dst_schema, u.dst_table);
+    if tbl_name <> all (locked) then
+      raise notice 'locking % ...', tbl_name;
+      execute 'lock ' || tbl_name;
+      locked := locked || array[tbl_name];
+
+      execute format('alter table %s disable trigger all', tbl_name);
+      raise notice 'disable triggers %', tbl_name;
+    end if;
+  end loop;
+
+  select l.lsn into prev_del_lsn from undo_log l where l.lsn <= i_del_lsn order by l.lsn desc limit 1;
+  if not found or prev_del_lsn is null then
+    raise exception 'run_undo: undo incomplete, abort';
+  end if;
+
+  raise notice 'undo events with LSN >= %', prev_del_lsn;
+
+  for u in with
+    src as (
+      delete from undo_log x
+      where x.lsn >= prev_del_lsn returning *
+    )
+    select * from src order by src.id desc
+  loop
+    last_canceled_lsn := u.lsn;
+
+    applied_cnt := applied_cnt + 1;
+    tbl_name := format('%I.%I', u.dst_schema, u.dst_table);
+
+    query := case u.undo_cmd
+      when 'D' then 'DELETE FROM ONLY '
+      when 'I' then 'INSERT INTO '
+      when 'U' then 'UPDATE ONLY '
+    end;
+
+    query := query || format('%s %s ', tbl_name, case when u.undo_cmd = 'I' then '' else quote_ident(tbl_alias) end);
+
+    query := query || case u.undo_cmd
+      when 'D' then ' WHERE ' || gen_where_pk(tbl_alias, u.cmd_pk)
+      when 'I' then format(' SELECT (populate_record(NULL::%s, $1)).* ', tbl_name)
+      when 'U' then ' SET ' || gen_upd_set(u.cmd_data) || ' WHERE ' || gen_where_pk(tbl_alias, u.cmd_pk)
+    end;
+
+    raise notice 'undo (% | %): %', u.id, last_canceled_lsn, query;
+
+    if u.undo_cmd = 'I' then
+      execute query using u.cmd_data;
+    else
+      execute query;
+    end if;
+  end loop;
+
+  --- set current replayed LSN to %', last_canceled_lsn
+  raise notice 'set current replayed LSN to %', last_canceled_lsn;
+  perform pg_replication_origin_advance(node_name, last_canceled_lsn);
+
+  --- turn on triggers
+  for rec in select unnest(locked) as tbl_name
+  loop
+    execute format('alter table %s enable trigger all', rec.tbl_name);
+    raise notice 'enable triggers %', rec.tbl_name;
+  end loop;
+
+  return applied_cnt;
+end
+$$;
+
+EOF
+
+
+psql -p 5434 -U postgres -1 -X -d dst -f init.sql
+
+
+-------- Reinitializing subscriber from another subscriber --------
+
+1. Creating a logical slot for a new subscriber:
+   pg_recvlogical -p 5432 -U postgres -d src --create-slot -S repca2 -P pgoutput
+   psql -p 5432 -U postgres -X -d src -c 'select slot_name, active  from pg_replication_slots'
+
+2. Disabling active subscription:
+
+psql -p 5434 -U postgres -X -d dst -c 'alter subscription repca1 disable'
+
+3. psql -p 5432 -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('category 3');
+insert into items (cat_id, v) values (3, 'value ddd');
+EOF
+
+
+
+4. Logging current LSN::
+   psql -p 5434 -U postgres -X -d dst -c 'select remote_lsn from pg_replication_origin_status'
+
+
+5. pg_dump -p 5434 -U postgres -Fc --serializable-deferrable --no-subscriptions -d dst \
+   | pg_restore -p 5435 -U postgres -C -d postgres
+
+6. At the same time:
+   psql -p 5434 -U postgres -X -d dst -c 'alter subscription repca1 enable'
+   psql -p 5434 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
+
+   psql -p 5435 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
+   psql -p 5432 -U postgres -X -d src -c 'select slot_name, restart_lsn, confirmed_flush_lsn, active  from pg_replication_slots'
+
+
+7. psql -p 5435 -U postgres -X -d dst -f- <<'EOF'
+create subscription repca2 connection 'port=5432 dbname=src' publication pub with (enabled = false, create_slot = false, copy_data = false);
+select oid, * from pg_subscription;
+EOF
+
+8. psql -p 5435 -U postgres -X -d dst -c 'select * from pg_replication_origin_status'
+   psql -p 5435 -U postgres -X -d dst -c "select pg_replication_origin_advance('pg_16557', '0/3039E78')"
+   psql -p 5435 -U postgres -X -d dst -c 'select * from pg_replication_origin_status'
+
+9. psql -p 5435 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
+   psql -p 5435 -U postgres -X -d dst -c 'alter subscription repca2 enable'
+   psql -p 5435 -U postgres -X -d dst -c 'select * from cats natural join items order by item_id'
+
+   psql -p 5432 -U postgres -X -d src -c 'select slot_name, restart_lsn, confirmed_flush_lsn from pg_replication_slots'
+   psql -p 5435 -U postgres -X -d dst -c 'select * from pg_replication_origin_status'
+   psql -p 5434 -U postgres -X -d dst -c 'select * from pg_replication_origin_status'
+   
+   
+   
+   
+-------- UNDO --------
+psql -p 5434 -U postgres -X -d dst -c 'select id, LSN, dst_schema, dst_table, undo_cmd, cmd_data, cmd_pk from undo_log order by id'
+
+
+--- revoke access to master from standby
+sudo mcedit /var/lib/postgresql/10/main/pg_hba.conf
+
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/main -o  "-p 5432" -l  /var/log/postgresql/postgresql-10-main.log reload
+
+
+
+psql -p5432 -U postgres -X -d src -c "select pg_terminate_backend(active_pid) from pg_replication_slots where slot_name = 'standby'"
+
+psql -p 5432 -U postgres -X -d src -c 'select * from cats natural join items order by item_id'
+psql -p 5433 -U postgres -X -d src -c 'select * from cats natural join items order by item_id'
+
+psql -p 5432 -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('category 10');
+insert into cats (cat_name) values ('category 20');
+insert into cats (cat_name) values ('category 30');
+EOF
+
+psql  -p 5432 -U postgres -X -d src -c 'select * from cats'
+psql  -p 5434 -U postgres -X -d dst -c 'select * from cats'
+psql  -p 5433 -U postgres -X -d src -c 'select * from cats'
+
+
+
+-------- master's crash and standby promotion --------
+
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/main -o  "-p 5432" -l  /var/log/postgresql/postgresql-10-main.log -m i stop 
+
+psql -p 5433 -U postgres -X -d src -c 'select pg_last_wal_replay_lsn()'
+
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/standby -o  "-p 5433" -l  /var/log/postgresql/postgresql-10-standby.log promote
+
+pg_recvlogical -p 5433 -U postgres -d src --create-slot -S repca1 -P pgoutput
+
+
+
+-------- new master is falling behind --------
+
+psql -p 5433 -U postgres -X -d src -c 'select * from cats'
+psql -p 5434 -U postgres -X -d dst -c 'select * from cats'
+
+psql -p 5434 -U postgres -X -d dst -c 'select * from undo_log order by id'
+psql -p 5434 -U postgres -X -d dst -c 'select * from pg_replication_origin_status'
+
+
+
+--- replication doesn't work
+
+psql -p 5434 -U postgres -X -d dst -f- <<'EOF'
+alter subscription repca1 CONNECTION 'port=5433 dbname=src';
+EOF
+
+psql -p 5433 -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('category 10');
+insert into cats (cat_name) values ('category 20');
+insert into cats (cat_name) values ('category 30');
+EOF
+
+psql -p 5434-U postgres -X -d dst -c 'select * from cats'
+psql -p 5433 -U postgres -X -d src -c 'select * from cats'
+
+-------- run Undo --------
+
+psql -p 5434 -U postgres -X -d dst -c 'alter subscription repca1 disable'
+
+psql  -p 5434 -U postgres -X -d dst -c 'select id, LSN, dst_schema, dst_table, undo_cmd, cmd_data, cmd_pk from undo_log order by id'
+psql  -p 5434 -U postgres -X -d dst -c 'select * from pg_replication_origin_status'
+
+psql  -p 5434 -U postgres -X -d dst -c "select run_undo('0/3037F60')"
+
+
+-------- logical replication is working now --------
+
+psql -p 5434 -U postgres -X -d dst -c 'alter subscription repca1 enable'
+
+psql -p 5433 -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('category 100');
+insert into cats (cat_name) values ('category 200');
+insert into cats (cat_name) values ('category 300');
+EOF
+
+psql -p 5433 -U postgres -X -d src -c 'select * from cats'
+psql -p 5434 -U postgres -X -d dst -c 'select * from cats'
+
+
+
+
+---------------REDO on subscriber-------------------------------
+
+sudo -u postgres -i 
+ps U postgres f
+
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/main -m f stop 
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/repca1 -m f -o "-p 5434" stop
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/repca2 -m f -o "-p 5435" stop
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/standby -m f -o "-p 5433" stop
+
+rm -r 10/main/*
+rm -r 10/repca1/*
+rm -r 10/repca2/*
+rm -r 10/standby/*
+
+/usr/lib/postgresql/10/bin/pg_ctl  -D /var/lib/postgresql/10/main  initdb
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/main -l  /var/log/postgresql/postgresql-10-main.log start 
+
+
+ /usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/repca1  initdb
+
+
+
+psql -p 5432 -U postgres -X -f- <<'EOF'
+alter system set wal_level = logical;
+alter system set log_min_messages to notice;
+EOF
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/main -o  "-p 5432" -l  /var/log/postgresql/postgresql-10-main.log restart 
+tail /var/log/postgresql/postgresql-10-main.log
+
+cat > init.sql <<'EOF'
+alter system set log_min_messages to notice;
+select pg_reload_conf();
+EOF
+
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/repca1 -l  /var/log/postgresql/postgresql-10-repca1.log -o "-p 5434" start
+psql -p 5434 -U postgres -X -f init.sql
+tail /var/log/postgresql/postgresql-10-repca1.log
+
+pg_receivewal -p 5434 --create-slot -S repca2
+pg_basebackup -p 5434 -D 10/repca2 -R -S repca2 -c fast
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/repca2 -l  /var/log/postgresql/postgresql-10-repca2.log -o "-p 5435" start
+tail /var/log/postgresql/postgresql-10-repca2.log 
+
+createdb -p 5432 -U postgres src
+createdb -p 5434 -U postgres dst
+
+
+cat > init.sql <<'EOF'
+create table cats (cat_id serial primary key, cat_name text unique);
+create table items (item_id serial primary key, created_at timestamptz default now(), cat_id int references cats, v text);
+EOF
+
+psql -p 5432 -U postgres -1 -X -d src -f init.sql
+
+psql -p 5434 -U postgres -1 -X -d dst -f init.sql
+
+psql -p 5432 -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('category 1');
+insert into cats (cat_name) values ('category 2');
+insert into items (cat_id, v) values (1, 'val aaa');
+insert into items (cat_id, v) values (2, 'val bbb');
+EOF
+
+
+psql -p 5432 -U postgres -X -d src -f- <<'EOF'
+create publication pub for table items, cats;
+EOF
+
+psql -p 5434 -U postgres -X -d dst -f- <<'EOF'
+create subscription repca1 connection 'port=5432 dbname=src' publication pub;
+EOF
+
+psql -p 5434 -U postgres -X -d dst -c 'select * from cats'
+psql -p 5435 -U postgres -X -d dst -c 'select * from cats'
+
+
+psql -p 5434 -U postgres -X -d dst -c 'select * from pg_replication_origin_status'
+psql -p 5435 -U postgres -X -d dst -c 'select * from pg_replication_origin_status'
+
+
+--- 1 Creating a logical slot to prevent WAL's rotation on provider's side(these WAL files can be needed for promoted subscriber's standby)
+pg_recvlogical -p 5432 -U postgres -d src --create-slot -S repca2 -P pgoutput
+psql -p 5432  -U postgres -X -d src -c 'select slot_name, active, confirmed_flush_lsn from pg_replication_slots'
+
+--- 2 Adding new changes for our logical consumer:
+psql -p 5432 -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('category 3');
+EOF
+
+--- 3. Checking pg_replication_origin status on subscriber's side and subscriber's standby side:
+psql -p 5434 -U postgres -X -d dst -c 'select local_lsn from pg_replication_origin_status'
+psql -p 5435 -U postgres -X -d dst -c 'select local_lsn from pg_replication_origin_status'
+
+--- 4. Replication slot for our subscriber's standby is in the past
+psql -p 5432 -U postgres -X -d src -c 'select slot_name, active, confirmed_flush_lsn from pg_replication_slots'
+
+--- 5. “Moving” replication slot with the help of SQL protocol
+psql -p 5432 -U postgres -X -d src -c "select * from pg_logical_slot_get_binary_changes('repca2'::name, xxxxx::pg_lsn, null::int, variadic array['proto_version', '1', 'publication_names', 'pub'])"
+----'0/1663738'
+--- 6. LSN for both replication slots are equal
+psql -p 5432 -U postgres -X -d src -c 'select slot_name, active, confirmed_flush_lsn from pg_replication_slots'
+
+--- 7. “Emulating delay of subscriber's standby replication” 
+
+sudo mcedit /var/lib/postgresql/10/repca1/pg_hba.conf
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/repca1 -l  /var/log/postgresql/postgresql-10-repca1.log -o "-p 5434" reload
+psql -p 5434 -U postgres -X -d dst -c "select pg_terminate_backend(active_pid) from pg_replication_slots where slot_name = 'repca2'"
+
+--- 8. Adding one more record in the replicated table
+
+psql -p 5432  -U postgres -1 -X -d src -f- <<'EOF'
+insert into cats (cat_name) values ('category 4');
+EOF
+
+
+--- 9. As expected subscriber's standby falls behind 
+
+psql -p 5434 -U postgres -X -d dst -c 'select * from cats'
+psql -p 5435 -U postgres -X -d dst -c 'select * from cats'
+
+--- 10. “Subscriber's crash”. Subscriber's standby is still behind
+
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/repca1 -m i -o "-p 5434" stop
+psql -p 5435 -U postgres -X -d dst -c 'select * from cats'
+
+
+--- 11. Dropping slot which was consumed by crashed subscriber's primary  
+
+psql -p 5432 -U postgres -X -d src -c "select pg_drop_replication_slot('repca1')"
+
+psql -p 5432  -U postgres -X -d src -c 'select * from pg_replication_slots'
+
+--- 12. Checking pg_replication_origin_status
+
+psql -p 5435 -U postgres -X -d dst -c 'select * from pg_replication_origin_status'
+
+--- 13. Sync “subscriber's standby slot” actual with subscriber's standby pg replication origin
+
+psql -p 5432 -U postgres -X -d src -c "select * from pg_logical_slot_get_binary_changes('repca2'::name, xxxx::pg_lsn, null::int, variadic array['proto_version', '1', 'publication_names', 'pub'])"
+---'0/3037B68'
+--- 14. Subscriber hasn't had new changes yet
+psql -p 5435 -U postgres -X -d dst -c 'select * from cats'
+
+--- 15. Promoting subscriber's standby
+
+/usr/lib/postgresql/10/bin/pg_ctl -D /var/lib/postgresql/10/repca2 promote
+
+--- 16. Promoted subscriber's standby is still behind
+
+psql -p 5435 -U postgres -X -d dst -c 'select * from cats'
+psql -p 5432 -U postgres -X -d src -c 'select * from cats'
+
+--- 17. Alter subscription: set actual slot, we prepared previously 
+
+psql -p 5435 -U postgres -X -d dst -f- <<'EOF'
+alter subscription repca1 set (slot_name = repca2);
+EOF
+
+--- 18. Slot turned on and started being consumed by subscriber
+
+psql -p 5432  -U postgres -X -d src -c 'select * from pg_replication_slots'
+
+
+--- 19. Subscriber replayed the changes
+
+psql -p 5435 -U postgres -X -d dst -c 'select * from pg_replication_origin_status'
+psql -p 5435 -U postgres -X -d dst -c 'select * from cats'
